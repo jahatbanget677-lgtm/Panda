@@ -1,7 +1,7 @@
-// Token Radar's dashboard, radar-2. It reads window.RADAR (written beside dashboard/ by
+// Token Radar's dashboard, radar-3. It reads window.RADAR (written beside dashboard/ by
 // main.ts) and renders the ranked board, the top signals, a filterable table, an inline detail
-// panel with the model's own inputs and the protocol's farm plan, and the model itself. No
-// network: every byte it shows is in data.js.
+// panel with the model's own inputs, why the row ranks where it does, and the protocol's farm plan,
+// and the model itself. No network: every byte it shows is in data.js.
 (function () {
   'use strict';
 
@@ -34,14 +34,34 @@
   // The model in one function, mirroring lib/model.ts exactly: the page recomputes a row from the
   // snapshot figures and checks the number board.json carries, so the page's code and the board's
   // data are visibly the same arithmetic. Peer multiple is the row's own, priced from live peers.
+  // Growth is the dampened curve: a wild week adds at most half the value. Age carries a young
+  // ramp, not a cliff: the cut fades linearly from 20% at day zero to nothing at ninety days.
   function impliedOf(row, model) {
-    var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
-    var growthMult = Math.max(model.growth_min_mult, 1 + (growth / 100) * model.growth_weight);
+    var g = row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d;
+    var growthMult = Math.max(model.growth_min_mult, 1 + model.growth_weight * (g / (model.growth_scale + Math.abs(g))));
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
     var ageMult = model.age_floor + (Math.min(Math.max(age, 0), model.age_days) / model.age_days) * model.age_range;
-    if (row.age_days !== null && row.age_days !== undefined && row.age_days < model.young_days) ageMult *= model.young_discount;
+    if (row.age_days !== null && row.age_days !== undefined && row.age_days < model.young_days) {
+      ageMult *= model.young_discount + (1 - model.young_discount) * (row.age_days / model.young_days);
+    }
     var breadth = 1 + model.breadth_step * Math.min((row.chains || []).length, model.breadth_max_chains);
     return Math.max(1, Math.round(row.tvl_usd * row.peer_multiple * growthMult * ageMult * breadth));
+  }
+
+  // Why the row ranks where it does: the factor that lifts it furthest above the model's floor,
+  // named and quantified, so the rank is explained, not just asserted.
+  function whyNote(row) {
+    var m = DATA.model;
+    var peerLift = row.peer_multiple / DATA.global_multiple - 1;
+    var growthLift = row.growth_multiplier - 1;
+    var ageLift = row.age_multiplier - m.age_floor;
+    var breadthLift = row.breadth_multiplier - 1;
+    var best = Math.max(peerLift, growthLift, ageLift, breadthLift);
+    if (best <= 0.02) return 'Scale — no single factor lifts this row: its TVL of ' + fmtUsd(row.tvl_usd) + ' is what puts it here.';
+    if (best === peerLift) return 'Rich peers — live protocols in ' + (row.category || 'Other') + ' trade at ' + fmtMult(row.peer_multiple) + ' of TVL, ' + (row.peer_multiple / DATA.global_multiple).toFixed(1) + 'x the live median of ' + fmtMult(DATA.global_multiple) + '.';
+    if (best === growthLift) return 'Momentum — its TVL moved ' + fmtPct(row.change_7d) + ' in seven days, the strongest lift on this row.';
+    if (best === ageLift) return 'Seasoned — it has run ' + fmtAge(row.age_days) + ' with no token on record, longer than most of the board.';
+    return 'Multi-chain — it is live on ' + (row.chains || []).length + ' chains, more surface to farm than a single-chain protocol.';
   }
 
   function el(tag, attrs) {
@@ -141,17 +161,28 @@
     if (s.length < 20) s = s + " Hold the position and check the protocol's own page.";
     return s;
   }
+  function gasUsd(chain) {
+    if (chain === 'Ethereum') return 6;
+    if (chain === 'Solana') return 0.05;
+    var cheap = ['Base', 'Arbitrum', 'Optimism', 'zkSync Era', 'Linea', 'Scroll', 'Blast', 'Mantle', 'Mode', 'Unichain', 'Ink', 'Soneium', 'Abstract', 'Zora', 'Polygon zkEVM', 'MegaETH'];
+    if (cheap.indexOf(chain) >= 0) return 0.3;
+    return 1;
+  }
+  function money(n) {
+    return n < 10 ? '$' + n.toFixed(2) : '$' + Math.round(n);
+  }
   function farmSteps(p) {
     var chain = chainOf(p);
     var token = gasToken(chain);
     var gas = gasCost(chain);
     var capital = capitalFor(p);
     var hold = holdDaysFor(p.age_days);
+    var weeks = Math.ceil(hold / 7);
     return [
       { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. Fund it with enough ' + token + ' on ' + chain + ' for the first transactions.', cost: gas + ' for the first transaction', time: '5 minutes' },
       { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and ' + gas, time: '15 minutes to set up' },
       { text: secondActionFor(p, capital, chain), cost: gas + ', no new capital', time: '10 minutes' },
-      { text: 'Make one qualifying action each week, such as a deposit, a swap, a vote or a claim, so the wallet stays active.', cost: gas + ' a week', time: '10 minutes a week' },
+      { text: 'Make one qualifying action each week, such as a deposit, a swap, a vote or a claim, so the wallet stays active.', cost: gas + ' a week (about ' + money(weeks * gasUsd(chain)) + ' over ' + weeks + ' weeks)', time: '10 minutes a week' },
       { text: "Open the protocol's own points or rewards page once a week and check the position counts toward it.", cost: 'no fee to check', time: '5 minutes a week' },
       { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
       { text: 'Before you withdraw, claim only from the link the protocol itself publishes, never pay to claim, then revoke the approvals and write the wallet, the dates and every transaction in a farm log.', cost: gas + ' to exit', time: '15 minutes' }
@@ -375,11 +406,12 @@
     var multRows = DATA.category_multiples.slice().sort(function (a, b) { return b.multiple - a.multiple || (a.category < b.category ? -1 : 1); });
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. The peer multiple is the median market-cap-to-TVL ratio of the live protocols in the same category (at least ' + m.peer_min_n + ' of them), else the global live median of ' + fmtMult(DATA.global_multiple) + '. No protocol name is special-cased, and no row is hand-picked.' }),
+      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. The peer multiple is a trimmed median of the live protocols in the same category (at least ' + m.peer_min_n + ' of them), winsorized so one absurd listing cannot price a category, and shrunk toward the global live median of ' + fmtMult(DATA.global_multiple) + ' by how few peers the category has: a thin category is mostly the market, not its own sample. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x peer x max(' + m.growth_min_mult + ', 1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.age_floor + ' + min(age_days, ' + m.age_days + ') / ' + m.age_days + ' x ' + m.age_range + ') x (1 + ' + m.breadth_step + ' x min(chains, ' + m.breadth_max_chains + ')) )'
+        'implied = round( tvl_usd x peer x max(' + m.growth_min_mult + ', 1 + ' + m.growth_weight + ' x change_7d / (' + m.growth_scale + ' + |change_7d|)) x (' + m.age_floor + ' + min(age_days, ' + m.age_days + ') / ' + m.age_days + ' x ' + m.age_range + ') x young-ramp x (1 + ' + m.breadth_step + ' x min(chains, ' + m.breadth_max_chains + ')) )'
       ),
-      el('p', { class: 'sub', text: 'Age is the time since the protocol was first listed, the best record of how long it has run with no token on record; under ' + m.young_days + ' days old the age factor is cut by ' + m.young_discount + ', and an unlisted age uses ' + m.unknown_age_days + ' days. Peer multiples are clamped to [' + m.peer_floor + ', ' + m.peer_cap + ']. The board never ranks a bridge, a wrapped or staked product of a token that already trades, an exchange, or a versioned pool: those are not protocols waiting for a launch of their own.' }),
+      el('p', { class: 'sub', text: 'young-ramp = ' + m.young_discount + ' + ' + (1 - m.young_discount).toFixed(2) + ' x min(age_days, ' + m.young_days + ') / ' + m.young_days + ' while age_days < ' + m.young_days + ', else 1.' }),
+      el('p', { class: 'sub', text: 'Growth is a dampened curve, not a clamp: a week of +15% lifts value about 12%, a week of +150% lifts it about 38%, and the snapshot’s fastest grower (+4,448% in a week) can add at most about 50%. Age is the time since the protocol was first listed, the best record of how long it has run with no token on record; under ' + m.young_days + ' days old the age factor fades in from a ' + Math.round((1 - m.young_discount) * 100) + '% cut at day zero, with no cliff, and an unlisted age uses ' + m.unknown_age_days + ' days. Peer multiples are clamped to [' + m.peer_floor + ', ' + m.peer_cap + ']. The board never ranks a bridge, a wrapped or staked product of a token that already trades, an exchange, or a versioned pool: those are not protocols waiting for a launch of their own.' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'mult-table' },
           el('caption', { class: 'sub', text: 'Peer multiples by category, from the live protocols in the snapshot.' }),
@@ -417,10 +449,12 @@
           el('div', null, el('span', { text: 'Chain breadth (' + (row.chains || []).length + ' chains)' }), el('b', { class: 'num', text: row.breadth_multiplier + 'x' })),
           el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
         ),
-        el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (match ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
+        el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (match ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' }),
+        el('p', { class: 'why', text: 'Why this rank: ' + whyNote(row) })
       ),
       el('div', { class: 'detail-section' },
         el('h3', { text: 'Farm plan' }),
+        el('p', { class: 'sub', text: row.farm_summary || '' }),
         el('ol', { class: 'steps' }, steps.map(function (s) {
           var at = s.indexOf(' Cost: ');
           var action = at >= 0 ? s.slice(0, at) : s;

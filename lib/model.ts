@@ -1,4 +1,4 @@
-// The token radar's model, radar-2: one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model, radar-3: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and every
 // other pre-token protocol the snapshot can rank: the early rows the radar exists to find. A protocol
@@ -8,15 +8,21 @@
 //
 // Implied value follows only from the snapshot's own figures, through four factors:
 //
-//   peer     = the live-token benchmark: the median market-cap-to-TVL ratio of the live protocols in
-//              the same category (at least 3 of them), else the median across all live protocols.
-//              A category whose tokens trade richly against TVL prices its pre-token peers richly;
-//              a category whose tokens trade thinly prices them thinly. Clamped to [0.05, 1.50].
-//   growth   = 1 + clamp(change_7d, -50, 150) / 100 x 0.6, floored at 0.5. A protocol whose TVL is
-//              growing fast is worth more than one whose TVL is shrinking; the clamp keeps one wild
-//              week (the snapshot's fastest grower is up over 4,000%) from deciding the board.
-//   age      = 0.70 + 0.30 x min(age_days, 1095) / 1095, with a 0.85 discount under 90 days old.
-//              A protocol that has run for years with no token on record is closer to a launch than
+//   peer     = the live-token benchmark, made sturdier than a plain median. Each live ratio is
+//              winsorized to [0.001, 5] so one absurd listing (the snapshot's worst is 400x its
+//              TVL) cannot price a category; a category with at least 5 live peers takes a trimmed
+//              median (its smallest and largest ratios dropped); and the result is shrunk toward
+//              the global live median, weight n / (n + 3), so a category with only 3 peers is half
+//              its own median and half the market. A category with fewer than 3 live peers uses
+//              the global median. Clamped to [0.05, 1.50].
+//   growth   = 1 + 0.5 x change_7d / (50 + |change_7d|), floored at 0.5. A dampened curve, not a
+//              clamp: a week of +15% lifts value ~12%, a week of +150% lifts it ~38%, and the
+//              snapshot's fastest grower (+4,444%) can add at most ~50%, so no single wild week
+//              decides the board. A week of -50% costs ~25%.
+//   age      = 0.65 + 0.35 x min(age_days, 1095) / 1095, times a young ramp of 0.80 + 0.20 x
+//              min(age_days, 90) / 90 while under 90 days old: the penalty for a brand-new listing
+//              grows smoothly from 20% at day zero to nothing at day ninety, with no cliff. A
+//              protocol that has run for years with no token on record is closer to a launch than
 //              one listed last month; age_days is null for 113 protocols, which take 365 days.
 //   breadth  = 1 + 0.02 x min(chains, 5). A protocol live on several chains has more surface to farm.
 //
@@ -53,9 +59,12 @@ export interface ModelConstants {
   peer_floor: number;
   peer_cap: number;
   peer_min_n: number;
+  peer_trim_n: number;
+  peer_shrink_k: number;
+  peer_winsor_low: number;
+  peer_winsor_high: number;
   growth_weight: number;
-  growth_floor: number;
-  growth_cap: number;
+  growth_scale: number;
   growth_min_mult: number;
   age_floor: number;
   age_range: number;
@@ -71,22 +80,25 @@ export const MODEL: ModelConstants = {
   peer_floor: 0.05,
   peer_cap: 1.5,
   peer_min_n: 3,
-  growth_weight: 0.6,
-  growth_floor: -50,
-  growth_cap: 150,
+  peer_trim_n: 5,
+  peer_shrink_k: 3,
+  peer_winsor_low: 0.001,
+  peer_winsor_high: 5,
+  growth_weight: 0.5,
+  growth_scale: 50,
   growth_min_mult: 0.5,
-  age_floor: 0.7,
-  age_range: 0.3,
+  age_floor: 0.65,
+  age_range: 0.35,
   age_days: 1095,
   young_days: 90,
-  young_discount: 0.85,
+  young_discount: 0.8,
   unknown_age_days: 365,
   breadth_step: 0.02,
   breadth_max_chains: 5,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -138,6 +150,7 @@ export interface BoardRow {
     age_days: number | null;
   };
   farm_steps: string[];
+  farm_summary: string;
 }
 
 /** The dashboard's compact view of one row, with farm plans generated in the page. */
@@ -159,6 +172,7 @@ export interface RadarRow {
   breadth_multiplier: number;
   driver: string;
   watchlist: boolean;
+  farm_summary: string;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -225,19 +239,29 @@ function median(sorted: number[]): number {
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 
 /**
- * The live-token benchmark: per category, the median market-cap-to-TVL ratio of that category's
- * live protocols (at least peer_min_n of them), else the median across all live protocols. Both are
- * clamped to [peer_floor, peer_cap], so one outlier category never prices the board. The table holds
- * only the categories with enough live peers, by category name.
+ * The live-token benchmark: per category, a trimmed median of the live protocols' market-cap-to-TVL
+ * ratios, shrunk toward the global live median. Each ratio is winsorized to [peer_winsor_low,
+ * peer_winsor_high] so one absurd listing cannot price a category; with at least peer_trim_n peers
+ * the smallest and largest ratios are dropped before the median; and the result is weighted
+ * n / (n + peer_shrink_k) against the global median, so a category with only a few live peers is
+ * mostly the market, not its own thin sample. A category with fewer than peer_min_n live peers uses
+ * the global median. All multiples are clamped to [peer_floor, peer_cap]. The table holds only the
+ * categories with enough live peers, by category name.
  */
 export function peerMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): PeerMultiples {
   const live = snapshot.protocols.filter((p) => !isPreToken(p) && p.category !== 'CEX');
+  const winsor = (r: number): number => Math.min(model.peer_winsor_high, Math.max(model.peer_winsor_low, r));
   const ratios = (ps: SnapshotProtocol[]): number[] =>
     ps
       .map((p) => (p.mcap_usd !== null && p.tvl_usd > 0 ? p.mcap_usd / p.tvl_usd : NaN))
       .filter((r) => Number.isFinite(r) && r > 0)
+      .map(winsor)
       .sort((a, b) => a - b);
   const clamp = (v: number): number => Math.min(model.peer_cap, Math.max(model.peer_floor, v));
+  const trimmedMedian = (rs: number[]): number => {
+    if (rs.length >= model.peer_trim_n) return median(rs.slice(1, -1));
+    return median(rs);
+  };
   const all = ratios(live);
   const global = all.length > 0 ? clamp(median(all)) : 0.25;
   const byCategory = new Map<string, number>();
@@ -246,7 +270,8 @@ export function peerMultiples(snapshot: Snapshot, model: ModelConstants = MODEL)
   for (const c of cats) {
     const rs = ratios(live.filter((p) => (p.category ?? 'Other') === c));
     if (rs.length >= model.peer_min_n) {
-      const m = clamp(median(rs));
+      const w = rs.length / (rs.length + model.peer_shrink_k);
+      const m = clamp(w * trimmedMedian(rs) + (1 - w) * global);
       byCategory.set(c, m);
       table.push({ category: c, n: rs.length, multiple: round4(m) });
     }
@@ -266,11 +291,20 @@ export function impliedValue(
   // dashboard stores is exactly the value the model used: the page's recompute must match.
   const peer = round4(multiples.byCategory.get(protocol.category ?? 'Other') ?? multiples.global);
   const rawGrowth = finite(protocol.change_7d, 0);
-  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = Math.max(model.growth_min_mult, 1 + (growthPct / 100) * model.growth_weight);
+  // A dampened curve, not a clamp: growth approaches 1 + growth_weight as the week goes to
+  // infinity, so a +4,444% week can add at most ~50% and a -50% week costs ~25%.
+  const growthPct = Math.round(rawGrowth * 100) / 100;
+  const growthMult = Math.max(
+    model.growth_min_mult,
+    1 + model.growth_weight * (rawGrowth / (model.growth_scale + Math.abs(rawGrowth))),
+  );
   const ageForModel = age ?? model.unknown_age_days;
   let ageMult = model.age_floor + (Math.min(Math.max(ageForModel, 0), model.age_days) / model.age_days) * model.age_range;
-  if (age !== null && age < model.young_days) ageMult *= model.young_discount;
+  // The young ramp, not a cliff: a listing's age factor is cut by up to 20% on day zero and the
+  // cut fades linearly to nothing at young_days, so day 89 and day 90 score almost alike.
+  if (age !== null && age < model.young_days) {
+    ageMult *= model.young_discount + (1 - model.young_discount) * (age / model.young_days);
+  }
   const breadthMult = 1 + model.breadth_step * Math.min(protocol.chains.length, model.breadth_max_chains);
   const implied = Math.max(1, Math.round(protocol.tvl_usd * peer * growthMult * ageMult * breadthMult));
   return { implied, peer, growthPct, growthMult, ageMult, breadthMult, age };
@@ -375,6 +409,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
+    farm_summary: farmSummary(s.p, s.age),
   }));
 }
 
@@ -416,6 +451,23 @@ function gasCost(chain: string): string {
   ]);
   if (cheap.has(chain)) return 'about $0.30 of gas';
   return 'about $1 of gas';
+}
+
+/** What one transaction costs on a chain, in whole US dollars: mainnet is dear, rollups are cheap, Solana is cheapest. */
+function gasUsd(chain: string): number {
+  if (chain === 'Ethereum') return 6;
+  if (chain === 'Solana') return 0.05;
+  const cheap = new Set([
+    'Base', 'Arbitrum', 'Optimism', 'zkSync Era', 'Linea', 'Scroll', 'Blast', 'Mantle', 'Mode',
+    'Unichain', 'Ink', 'Soneium', 'Abstract', 'Zora', 'Polygon zkEVM', 'MegaETH',
+  ]);
+  if (cheap.has(chain)) return 0.3;
+  return 1;
+}
+
+/** A dollar amount in the plan's own words: cents below $10, whole dollars above. */
+function money(n: number): string {
+  return n < 10 ? `$${n.toFixed(2)}` : `$${Math.round(n)}`;
 }
 
 /** How much capital one farm position needs, from the protocol's own TVL. */
@@ -486,14 +538,17 @@ function secondActionFor(p: SnapshotProtocol, capital: number, chain: string): s
  * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived
  * from the protocol's own record (category, chains, TVL, age), never from a hand-written list of
  * names: the gas token and the gas price follow its first chain, the capital follows its TVL, the
- * hold follows its age, and both actions follow its category.
+ * hold follows its age, and both actions follow its category. The weekly step states what the
+ * whole hold costs in gas, not just one week of it.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
   const token = gasToken(chain);
   const gas = gasCost(chain);
+  const gasN = gasUsd(chain);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
+  const weeks = Math.ceil(hold / 7);
   return [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. Fund it with enough ${token} on ${chain} for the first transactions.`,
@@ -512,7 +567,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
     },
     {
       text: `Make one qualifying action each week, such as a deposit, a swap, a vote or a claim, so the wallet stays active.`,
-      cost: `${gas} a week`,
+      cost: `${gas} a week (about ${money(weeks * gasN)} over ${weeks} weeks)`,
       time: '10 minutes a week',
     },
     {
@@ -531,6 +586,27 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '15 minutes',
     },
   ];
+}
+
+/**
+ * The plan's totals, in one line: the gas for every transaction the plan makes (one to fund, one
+ * for each of the two actions, one a week through the hold, two to claim and revoke on exit), the
+ * capital deployed and returned on exit, and the active time spread over the hold. The capital is
+ * never spent, only parked: the cost is the gas.
+ */
+export function farmSummary(p: SnapshotProtocol, age: number | null): string {
+  const gasN = gasUsd(chainOf(p));
+  const capital = capitalFor(p);
+  const hold = holdDaysFor(age);
+  const weeks = Math.ceil(hold / 7);
+  const txs = 5 + weeks;
+  const totalGas = txs * gasN;
+  const activeMinutes = 45 + weeks * 15;
+  const active =
+    activeMinutes >= 60
+      ? `about ${(Math.round((activeMinutes / 60) * 2) / 2).toString().replace(/\.0$/, '')} hours of active time`
+      : `about ${activeMinutes} minutes of active time`;
+  return `Plan total: about ${money(totalGas)} in gas across ${txs} transactions over ${hold} days, plus $${capital} of capital deployed and returned on exit. ${active.charAt(0).toUpperCase() + active.slice(1)} spread over the ${hold} days.`;
 }
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
@@ -571,6 +647,7 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
     breadth_multiplier: row.model.breadth_multiplier,
     driver: row.driver,
     watchlist: watchlist.has(row.slug),
+    farm_summary: row.farm_summary,
   };
 }
 

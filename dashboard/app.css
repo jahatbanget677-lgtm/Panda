@@ -121,6 +121,7 @@ tbody tr[data-selected="true"] { background: var(--panel); box-shadow: inset 3px
 .steps b { display: block; font-weight: 500; }
 .cost { color: var(--muted); font-size: 12px; font-family: var(--font-num); }
 .note { color: var(--muted); font-size: 13px; border-left: 2px solid var(--accent-dim); padding-left: var(--s3); }
+.why { color: var(--ink); font-size: 14px; border-left: 2px solid var(--accent); padding-left: var(--s3); margin-top: var(--s2); }
 
 .model { margin-top: var(--s4); padding: var(--s5); display: grid; gap: var(--s3); }
 .formula { font-family: var(--font-num); font-size: 13px; line-height: 1.7; color: var(--muted); overflow-wrap: anywhere; background: var(--canvas); border: 1px solid var(--border); border-radius: var(--radius-control); padding: var(--s3); }
